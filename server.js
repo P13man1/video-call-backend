@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const bcrypt = require('bcrypt');
 
 const app = express();
 app.use(cors());
@@ -15,183 +16,284 @@ const io = socketIo(server, {
   }
 });
 
-// Store active users and messages
-const activeUsers = new Map(); // socketId -> { username, anonymousId }
-const messages = []; // Store last 100 messages
-const MAX_MESSAGES = 100;
+// Database (in-memory)
+const users = new Map(); // username -> { passwordHash, socketId, isOnline, calls: [] }
+const activeCalls = new Map(); // callId -> { caller, callee, isActive }
 
-// Generate anonymous names
-const anonymousNames = [
-  'Anonymous Cat', 'Hidden Fox', 'Secret Owl', 'Mysterious Wolf',
-  'Ghost User', 'Shadow Panther', 'Invisible Bear', 'Unknown Entity',
-  'Faceless One', 'Nameless Wanderer', 'Silent Observer', 'Quiet Raven',
-  'Stealth Tiger', 'Covert Eagle', 'Masked Raccoon', 'Veiled Serpent'
-];
-
-function getRandomAnonymousName() {
-  return anonymousNames[Math.floor(Math.random() * anonymousNames.length)] + '_' + Math.floor(Math.random() * 1000);
+// Helper functions
+function generateCallId() {
+  return Date.now().toString() + Math.random().toString(36).substring(2, 6);
 }
 
-io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+// ========== AUTH ROUTES ==========
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
   
-  // Generate anonymous ID for this connection
-  const anonymousId = getRandomAnonymousName();
-  
-  // Store user info
-  activeUsers.set(socket.id, {
-    username: null,
-    anonymousId: anonymousId,
-    isAnonymous: true
-  });
-  
-  // Send connection success with anonymous ID
-  socket.emit('connected', {
-    anonymousId: anonymousId,
-    message: 'Connected to chat! Say hello! 👋'
-  });
-  
-  // Send chat history to new user
-  socket.emit('chat-history', messages.slice(-MAX_MESSAGES));
-  
-  // Broadcast updated user count
-  broadcastUserCount();
-  
-  // Handle user joining with username
-  socket.on('set-username', (username) => {
-    const user = activeUsers.get(socket.id);
-    if (user && username && username.trim().length > 0) {
-      // Check if username is taken
-      let isTaken = false;
-      for (let [id, u] of activeUsers.entries()) {
-        if (u.username === username.trim() && id !== socket.id) {
-          isTaken = true;
-          break;
-        }
-      }
-      
-      if (!isTaken && username.trim().length < 20) {
-        const oldName = user.username || user.anonymousId;
-        user.username = username.trim();
-        user.isAnonymous = false;
-        activeUsers.set(socket.id, user);
-        
-        // Broadcast name change
-        io.emit('user-name-changed', {
-          oldName: oldName,
-          newName: username.trim(),
-          isAnonymous: false
-        });
-        
-        socket.emit('username-set', { success: true, username: username.trim() });
-      } else {
-        socket.emit('username-set', { 
-          success: false, 
-          error: isTaken ? 'Username already taken' : 'Invalid username'
-        });
-      }
-    }
-  });
-  
-  // Handle staying anonymous
-  socket.on('stay-anonymous', () => {
-    const user = activeUsers.get(socket.id);
-    if (user) {
-      socket.emit('username-set', { 
-        success: true, 
-        username: user.anonymousId,
-        isAnonymous: true
-      });
-    }
-  });
-  
-  // Handle new messages
-  socket.on('send-message', (messageData) => {
-    const user = activeUsers.get(socket.id);
-    if (!user) return;
-    
-    const displayName = user.username || user.anonymousId;
-    const message = {
-      id: Date.now() + Math.random(),
-      username: displayName,
-      text: messageData.text.substring(0, 500), // Limit message length
-      timestamp: new Date().toISOString(),
-      isAnonymous: user.isAnonymous,
-      userId: socket.id
-    };
-    
-    // Store message
-    messages.push(message);
-    if (messages.length > MAX_MESSAGES) {
-      messages.shift();
-    }
-    
-    // Broadcast to all users
-    io.emit('new-message', message);
-    console.log(`Message from ${displayName}: ${message.text}`);
-  });
-  
-  // Handle typing indicators
-  socket.on('typing', (isTyping) => {
-    const user = activeUsers.get(socket.id);
-    if (user) {
-      const displayName = user.username || user.anonymousId;
-      socket.broadcast.emit('user-typing', {
-        username: displayName,
-        isTyping: isTyping
-      });
-    }
-  });
-  
-  // Handle disconnect
-  socket.on('disconnect', () => {
-    const user = activeUsers.get(socket.id);
-    if (user) {
-      const displayName = user.username || user.anonymousId;
-      console.log(`User disconnected: ${displayName}`);
-      
-      // Broadcast user left
-      io.emit('user-left', {
-        username: displayName,
-        message: `${displayName} left the chat`
-      });
-    }
-    
-    activeUsers.delete(socket.id);
-    broadcastUserCount();
-  });
-});
-
-function broadcastUserCount() {
-  const users = [];
-  for (let [id, user] of activeUsers.entries()) {
-    users.push({
-      name: user.username || user.anonymousId,
-      isAnonymous: user.isAnonymous
-    });
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' });
   }
   
-  io.emit('user-count', {
-    count: activeUsers.size,
-    users: users.slice(0, 20) // Send first 20 users
+  if (username.length < 3 || username.length > 20) {
+    return res.status(400).json({ error: 'Username must be 3-20 characters' });
+  }
+  
+  if (password.length < 4) {
+    return res.status(400).json({ error: 'Password must be at least 4 characters' });
+  }
+  
+  if (users.has(username)) {
+    return res.status(400).json({ error: 'Username already exists' });
+  }
+  
+  const passwordHash = await bcrypt.hash(password, 10);
+  users.set(username, { 
+    passwordHash, 
+    socketId: null, 
+    isOnline: false,
+    calls: []
   });
-}
+  
+  res.json({ success: true, message: 'User registered successfully' });
+});
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  if (!users.has(username)) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  const user = users.get(username);
+  const validPassword = await bcrypt.compare(password, user.passwordHash);
+  
+  if (!validPassword) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  res.json({ success: true, username: username });
+});
+
+app.get('/api/users', (req, res) => {
+  const onlineUsers = [];
+  for (let [username, user] of users.entries()) {
+    if (user.isOnline) {
+      onlineUsers.push({ username, isOnline: true });
+    }
+  }
+  res.json(onlineUsers);
+});
+
+// ========== SOCKET.IO HANDLING ==========
+io.on('connection', (socket) => {
+  console.log(`🔌 New connection: ${socket.id}`);
+  let currentUser = null;
+  
+  // Authenticate user
+  socket.on('authenticate', async (username) => {
+    if (users.has(username)) {
+      const user = users.get(username);
+      user.socketId = socket.id;
+      user.isOnline = true;
+      currentUser = username;
+      
+      socket.emit('authenticated', { 
+        success: true, 
+        username: username 
+      });
+      
+      // Broadcast online status to all users
+      io.emit('user-online', { username });
+      
+      // Send list of online users to this user
+      const onlineUsers = [];
+      for (let [name, u] of users.entries()) {
+        if (u.isOnline && name !== username) {
+          onlineUsers.push({ username: name });
+        }
+      }
+      socket.emit('online-users', onlineUsers);
+      
+      console.log(`✅ ${username} authenticated`);
+    }
+  });
+  
+  // ========== PRIVATE MESSAGING ==========
+  socket.on('private-message', ({ to, text }) => {
+    if (!currentUser) return;
+    
+    const recipient = users.get(to);
+    if (recipient && recipient.isOnline && recipient.socketId) {
+      const message = {
+        from: currentUser,
+        text: text.substring(0, 500),
+        timestamp: new Date().toISOString(),
+        type: 'text'
+      };
+      
+      // Send to recipient
+      io.to(recipient.socketId).emit('private-message', message);
+      
+      // Confirm to sender
+      socket.emit('message-sent', { to, text, timestamp: message.timestamp });
+      
+      console.log(`💬 Private message from ${currentUser} to ${to}`);
+    } else {
+      socket.emit('error', { message: 'User is offline' });
+    }
+  });
+  
+  // ========== AUDIO CALL SIGNALING ==========
+  socket.on('call-user', ({ targetUsername }) => {
+    if (!currentUser) {
+      socket.emit('call-error', { message: 'You are not authenticated' });
+      return;
+    }
+    
+    const targetUser = users.get(targetUsername);
+    
+    if (!targetUser || !targetUser.isOnline || !targetUser.socketId) {
+      socket.emit('call-error', { message: `${targetUsername} is offline` });
+      return;
+    }
+    
+    const callId = generateCallId();
+    activeCalls.set(callId, {
+      caller: currentUser,
+      callee: targetUsername,
+      isActive: true,
+      startTime: Date.now()
+    });
+    
+    // Store call in user's history
+    const caller = users.get(currentUser);
+    const callee = users.get(targetUsername);
+    if (caller) caller.calls.push({ callId, with: targetUsername, timestamp: Date.now() });
+    if (callee) callee.calls.push({ callId, with: currentUser, timestamp: Date.now() });
+    
+    // Notify target
+    io.to(targetUser.socketId).emit('incoming-call', {
+      callId,
+      from: currentUser
+    });
+    
+    console.log(`📞 Call from ${currentUser} to ${targetUsername}, ID: ${callId}`);
+  });
+  
+  socket.on('accept-call', ({ callId }) => {
+    const call = activeCalls.get(callId);
+    if (!call) {
+      socket.emit('call-error', { message: 'Call no longer exists' });
+      return;
+    }
+    
+    const caller = users.get(call.caller);
+    if (caller && caller.socketId) {
+      io.to(caller.socketId).emit('call-accepted', { callId });
+      console.log(`✅ Call ${callId} accepted by ${call.callee}`);
+    }
+  });
+  
+  socket.on('reject-call', ({ callId }) => {
+    const call = activeCalls.get(callId);
+    if (call) {
+      const caller = users.get(call.caller);
+      if (caller && caller.socketId) {
+        io.to(caller.socketId).emit('call-rejected', { callId });
+      }
+      activeCalls.delete(callId);
+      console.log(`❌ Call ${callId} rejected by ${call.callee}`);
+    }
+  });
+  
+  socket.on('end-call', ({ callId }) => {
+    const call = activeCalls.get(callId);
+    if (call) {
+      const caller = users.get(call.caller);
+      const callee = users.get(call.callee);
+      
+      if (caller && caller.socketId) {
+        io.to(caller.socketId).emit('call-ended', { callId });
+      }
+      if (callee && callee.socketId) {
+        io.to(callee.socketId).emit('call-ended', { callId });
+      }
+      
+      activeCalls.delete(callId);
+      console.log(`📞 Call ${callId} ended`);
+    }
+  });
+  
+  // WebRTC signaling for audio calls
+  socket.on('call-offer', ({ callId, offer }) => {
+    const call = activeCalls.get(callId);
+    if (!call) return;
+    
+    const targetUser = users.get(call.callee);
+    if (targetUser && targetUser.socketId) {
+      io.to(targetUser.socketId).emit('call-offer', { callId, offer });
+    }
+  });
+  
+  socket.on('call-answer', ({ callId, answer }) => {
+    const call = activeCalls.get(callId);
+    if (!call) return;
+    
+    const caller = users.get(call.caller);
+    if (caller && caller.socketId) {
+      io.to(caller.socketId).emit('call-answer', { callId, answer });
+    }
+  });
+  
+  socket.on('ice-candidate', ({ callId, candidate }) => {
+    const call = activeCalls.get(callId);
+    if (!call) return;
+    
+    // Find the other participant
+    const targetUsername = call.caller === currentUser ? call.callee : call.caller;
+    const targetUser = users.get(targetUsername);
+    
+    if (targetUser && targetUser.socketId) {
+      io.to(targetUser.socketId).emit('ice-candidate', { callId, candidate });
+    }
+  });
+  
+  // ========== DISCONNECT ==========
+  socket.on('disconnect', () => {
+    if (currentUser) {
+      const user = users.get(currentUser);
+      if (user) {
+        user.isOnline = false;
+        user.socketId = null;
+        io.emit('user-offline', { username: currentUser });
+        console.log(`🔴 ${currentUser} disconnected`);
+      }
+    }
+    
+    // End any active calls from this user
+    for (let [callId, call] of activeCalls.entries()) {
+      if (call.caller === currentUser || call.callee === currentUser) {
+        const otherUser = call.caller === currentUser ? call.callee : call.caller;
+        const other = users.get(otherUser);
+        if (other && other.socketId) {
+          io.to(other.socketId).emit('call-ended', { callId, reason: 'user-disconnected' });
+        }
+        activeCalls.delete(callId);
+      }
+    }
+  });
+});
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    users: activeUsers.size,
-    messages: messages.length
+    onlineUsers: Array.from(users.values()).filter(u => u.isOnline).length,
+    activeCalls: activeCalls.size
   });
-});
-
-app.get('/', (req, res) => {
-  res.send('Anonymous Chat Server Running');
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 Chat server running on port ${PORT}`);
-  console.log(`📡 Socket.IO ready for connections`);
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 WebSocket ready for calls and messages`);
 });
