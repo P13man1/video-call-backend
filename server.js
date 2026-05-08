@@ -16,16 +16,21 @@ const io = socketIo(server, {
   }
 });
 
-// Database (in-memory)
-const users = new Map(); // username -> { passwordHash, socketId, isOnline, calls: [] }
-const activeCalls = new Map(); // callId -> { caller, callee, isActive }
+// In-memory storage
+const users = new Map(); // username -> { passwordHash, socketId, isOnline }
+const privateMessages = new Map(); // `user1_user2` -> array of messages
+const activeCalls = new Map(); // callId -> { caller, callee }
 
 // Helper functions
 function generateCallId() {
   return Date.now().toString() + Math.random().toString(36).substring(2, 6);
 }
 
-// ========== AUTH ROUTES ==========
+function getMessagesKey(user1, user2) {
+  return [user1, user2].sort().join('_');
+}
+
+// ========== REST API ROUTES ==========
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   
@@ -49,8 +54,7 @@ app.post('/api/register', async (req, res) => {
   users.set(username, { 
     passwordHash, 
     socketId: null, 
-    isOnline: false,
-    calls: []
+    isOnline: false 
   });
   
   res.json({ success: true, message: 'User registered successfully' });
@@ -77,34 +81,31 @@ app.get('/api/users', (req, res) => {
   const onlineUsers = [];
   for (let [username, user] of users.entries()) {
     if (user.isOnline) {
-      onlineUsers.push({ username, isOnline: true });
+      onlineUsers.push({ username });
     }
   }
   res.json(onlineUsers);
 });
 
-// ========== SOCKET.IO HANDLING ==========
+// ========== SOCKET.IO EVENTS ==========
 io.on('connection', (socket) => {
-  console.log(`🔌 New connection: ${socket.id}`);
+  console.log('New connection:', socket.id);
   let currentUser = null;
   
-  // Authenticate user
-  socket.on('authenticate', async (username) => {
+  // Authenticate
+  socket.on('authenticate', (username) => {
     if (users.has(username)) {
       const user = users.get(username);
       user.socketId = socket.id;
       user.isOnline = true;
       currentUser = username;
       
-      socket.emit('authenticated', { 
-        success: true, 
-        username: username 
-      });
+      socket.emit('authenticated', { success: true, username });
       
-      // Broadcast online status to all users
+      // Broadcast to all users
       io.emit('user-online', { username });
       
-      // Send list of online users to this user
+      // Send online users list to new user
       const onlineUsers = [];
       for (let [name, u] of users.entries()) {
         if (u.isOnline && name !== username) {
@@ -117,35 +118,66 @@ io.on('connection', (socket) => {
     }
   });
   
-  // ========== PRIVATE MESSAGING ==========
-  socket.on('private-message', ({ to, text }) => {
+  // ========== TEXT CHAT ==========
+  socket.on('send-message', ({ to, text }) => {
+    if (!currentUser || !text.trim()) return;
+    
+    const recipient = users.get(to);
+    const message = {
+      id: Date.now() + Math.random(),
+      from: currentUser,
+      text: text.substring(0, 500),
+      timestamp: new Date().toISOString(),
+      type: 'text'
+    };
+    
+    // Store message
+    const key = getMessagesKey(currentUser, to);
+    if (!privateMessages.has(key)) {
+      privateMessages.set(key, []);
+    }
+    privateMessages.get(key).push(message);
+    
+    // Keep only last 100 messages
+    if (privateMessages.get(key).length > 100) {
+      privateMessages.get(key).shift();
+    }
+    
+    // Send to recipient if online
+    if (recipient && recipient.isOnline && recipient.socketId) {
+      io.to(recipient.socketId).emit('new-message', message);
+    }
+    
+    // Confirm to sender
+    socket.emit('message-sent', message);
+  });
+  
+  // Load chat history
+  socket.on('load-history', ({ withUser }) => {
+    if (!currentUser) return;
+    
+    const key = getMessagesKey(currentUser, withUser);
+    const history = privateMessages.get(key) || [];
+    socket.emit('chat-history', { withUser, messages: history });
+  });
+  
+  // Typing indicator
+  socket.on('typing', ({ to, isTyping }) => {
     if (!currentUser) return;
     
     const recipient = users.get(to);
     if (recipient && recipient.isOnline && recipient.socketId) {
-      const message = {
+      io.to(recipient.socketId).emit('user-typing', {
         from: currentUser,
-        text: text.substring(0, 500),
-        timestamp: new Date().toISOString(),
-        type: 'text'
-      };
-      
-      // Send to recipient
-      io.to(recipient.socketId).emit('private-message', message);
-      
-      // Confirm to sender
-      socket.emit('message-sent', { to, text, timestamp: message.timestamp });
-      
-      console.log(`💬 Private message from ${currentUser} to ${to}`);
-    } else {
-      socket.emit('error', { message: 'User is offline' });
+        isTyping
+      });
     }
   });
   
-  // ========== AUDIO CALL SIGNALING ==========
+  // ========== VOICE CALLS ==========
   socket.on('call-user', ({ targetUsername }) => {
     if (!currentUser) {
-      socket.emit('call-error', { message: 'You are not authenticated' });
+      socket.emit('call-error', { message: 'Not authenticated' });
       return;
     }
     
@@ -160,15 +192,8 @@ io.on('connection', (socket) => {
     activeCalls.set(callId, {
       caller: currentUser,
       callee: targetUsername,
-      isActive: true,
-      startTime: Date.now()
+      isActive: true
     });
-    
-    // Store call in user's history
-    const caller = users.get(currentUser);
-    const callee = users.get(targetUsername);
-    if (caller) caller.calls.push({ callId, with: targetUsername, timestamp: Date.now() });
-    if (callee) callee.calls.push({ callId, with: currentUser, timestamp: Date.now() });
     
     // Notify target
     io.to(targetUser.socketId).emit('incoming-call', {
@@ -176,20 +201,21 @@ io.on('connection', (socket) => {
       from: currentUser
     });
     
-    console.log(`📞 Call from ${currentUser} to ${targetUsername}, ID: ${callId}`);
+    console.log(`📞 Call from ${currentUser} to ${targetUsername}`);
   });
   
   socket.on('accept-call', ({ callId }) => {
     const call = activeCalls.get(callId);
     if (!call) {
-      socket.emit('call-error', { message: 'Call no longer exists' });
+      socket.emit('call-error', { message: 'Call not found' });
       return;
     }
     
     const caller = users.get(call.caller);
     if (caller && caller.socketId) {
       io.to(caller.socketId).emit('call-accepted', { callId });
-      console.log(`✅ Call ${callId} accepted by ${call.callee}`);
+      socket.emit('call-connected', { callId, with: call.caller });
+      console.log(`✅ Call ${callId} accepted`);
     }
   });
   
@@ -201,7 +227,7 @@ io.on('connection', (socket) => {
         io.to(caller.socketId).emit('call-rejected', { callId });
       }
       activeCalls.delete(callId);
-      console.log(`❌ Call ${callId} rejected by ${call.callee}`);
+      console.log(`❌ Call ${callId} rejected`);
     }
   });
   
@@ -223,7 +249,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // WebRTC signaling for audio calls
+  // WebRTC signaling
   socket.on('call-offer', ({ callId, offer }) => {
     const call = activeCalls.get(callId);
     if (!call) return;
@@ -248,7 +274,6 @@ io.on('connection', (socket) => {
     const call = activeCalls.get(callId);
     if (!call) return;
     
-    // Find the other participant
     const targetUsername = call.caller === currentUser ? call.callee : call.caller;
     const targetUser = users.get(targetUsername);
     
@@ -269,7 +294,7 @@ io.on('connection', (socket) => {
       }
     }
     
-    // End any active calls from this user
+    // End active calls
     for (let [callId, call] of activeCalls.entries()) {
       if (call.caller === currentUser || call.callee === currentUser) {
         const otherUser = call.caller === currentUser ? call.callee : call.caller;
@@ -285,15 +310,17 @@ io.on('connection', (socket) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  const onlineCount = Array.from(users.values()).filter(u => u.isOnline).length;
   res.json({ 
     status: 'ok', 
-    onlineUsers: Array.from(users.values()).filter(u => u.isOnline).length,
+    onlineUsers: onlineCount,
+    totalUsers: users.size,
     activeCalls: activeCalls.size
   });
 });
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 WebSocket ready for calls and messages`);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`📡 WebSocket ready`);
 });
