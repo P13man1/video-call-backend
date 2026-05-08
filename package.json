@@ -1,7 +1,7 @@
 {
-  "name": "video-call-signaling-server",
+  "name": "anonymous-chat-server",
   "version": "1.0.0",
-  "description": "WebRTC signaling server for video calls",
+  "description": "Real-time anonymous chat server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
